@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>500格微距監控相機</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #0f172a; color: #e2e8f0; font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
+        .monitor-active { border: 2px solid #22c55e; }
+        .monitor-alert { border: 4px solid #ef4444; }
+        
+        /* 網格覆蓋層 */
+        #gridOverlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 20;
+        }
+
+        /* 隱藏的分析畫布 */
+        #analysisCanvas { display: none; }
+    </style>
+</head>
+<body class="flex flex-col h-screen">
+
+    <!-- 頂部資訊 -->
+    <div class="px-4 py-3 bg-slate-900 shadow-md z-30 flex justify-between items-center shrink-0">
+        <div>
+            <h1 class="text-lg font-bold text-white">📡 500格矩陣監控</h1>
+            <div class="text-xs text-slate-400" id="statusText">等待啟動...</div>
+        </div>
+        <div class="text-right">
+             <div class="text-xs text-slate-400">觸發網格數</div>
+             <div id="activeGridCount" class="font-mono text-xl font-bold text-green-400">0</div>
+        </div>
+    </div>
+
+    <!-- 主畫面區域 -->
+    <div class="flex-1 relative bg-black flex justify-center items-center overflow-hidden">
+        <div class="relative w-full h-full max-w-lg mx-auto bg-black">
+            <!-- 視訊畫面 -->
+            <video id="video" autoplay playsinline muted class="absolute inset-0 w-full h-full object-cover"></video>
+            
+            <!-- 視覺化網格層 (用於顯示哪一格在動) -->
+            <canvas id="gridOverlay"></canvas>
+
+            <!-- 警告橫幅 -->
+            <div id="alertBanner" class="absolute top-4 left-1/2 -translate-x-1/2 bg-red-600 text-white px-6 py-2 rounded-full font-bold shadow-lg hidden z-40 animate-bounce whitespace-nowrap">
+                🚨 偵測到變化!
+            </div>
+        </div>
+    </div>
+
+    <!-- 底部控制區 -->
+    <div class="bg-slate-800 p-4 space-y-3 z-30 shrink-0 rounded-t-xl shadow-[0_-4px_10px_rgba(0,0,0,0.5)]">
+        
+        <div class="grid grid-cols-2 gap-4">
+            <!-- 靈敏度控制 -->
+            <div>
+                <div class="flex justify-between mb-1">
+                    <label class="text-xs text-slate-300">靈敏度 (越低越敏感)</label>
+                    <span id="thresholdValue" class="text-xs font-bold text-blue-400">40</span>
+                </div>
+                <input type="range" id="threshold" min="10" max="150" value="40" class="w-full h-2 bg-slate-600 rounded-lg appearance-none cursor-pointer">
+            </div>
+
+            <!-- 冷卻時間控制 -->
+            <div>
+                <div class="flex justify-between mb-1">
+                    <label class="text-xs text-slate-300">冷卻時間 (秒)</label>
+                </div>
+                <input type="number" id="cooldownInput" min="1" max="300" value="15" class="w-full h-8 bg-slate-700 border border-slate-600 rounded px-2 text-sm text-center focus:outline-none focus:border-blue-500 text-white">
+            </div>
+        </div>
+
+        <!-- 開關 -->
+        <div class="grid grid-cols-2 gap-3">
+            <button id="startBtn" class="bg-blue-600 hover:bg-blue-500 text-white py-3 rounded-lg font-bold text-base active:scale-95 transition-all shadow-lg">
+                啟動相機
+            </button>
+            <button id="stopBtn" class="bg-slate-600 hover:bg-slate-500 text-white py-3 rounded-lg font-bold text-base active:scale-95 transition-all shadow-lg" disabled>
+                停止
+            </button>
+        </div>
+        
+        <!-- Log -->
+        <div class="h-20 bg-black/50 rounded p-2 overflow-y-auto text-[10px] font-mono border border-slate-700 text-slate-300" id="logs">
+            <div class="opacity-50">系統準備就緒...</div>
+        </div>
+    </div>
+
+    <!-- 用於計算的隱藏 Canvas (25x20 = 500格) -->
+    <canvas id="analysisCanvas"></canvas>
+
+    <script>
+        // === 設定 ===
+        const DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1360587650632781824/ksBqXJAPmPo1jwbctDGCJNsj7_aJYmtZ4PoGIDS4w1ttAqzmMkY3BqoA9kmspLUTpIvT";
+        
+        // 設定網格密度: 25行 x 20列 = 500格
+        const GRID_COLS = 25; 
+        const GRID_ROWS = 20;
+
+        // === DOM 元素 ===
+        const video = document.getElementById('video');
+        const analysisCanvas = document.getElementById('analysisCanvas');
+        const analysisCtx = analysisCanvas.getContext('2d', { willReadFrequently: true });
+        const gridOverlay = document.getElementById('gridOverlay');
+        const gridCtx = gridOverlay.getContext('2d');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const statusText = document.getElementById('statusText');
+        const activeGridCountEl = document.getElementById('activeGridCount');
+        const thresholdInput = document.getElementById('threshold');
+        const thresholdValue = document.getElementById('thresholdValue');
+        const cooldownInput = document.getElementById('cooldownInput');
+        const logs = document.getElementById('logs');
+        const alertBanner = document.getElementById('alertBanner');
+
+        // === 狀態變數 ===
+        let stream = null;
+        let isMonitoring = false;
+        let lastFrameData = null; // 儲存 500 格的 RGB 數據
+        let lastAlertTime = 0;
+        let animationFrameId = null;
+
+        // === 初始化 ===
+        thresholdInput.addEventListener('input', (e) => {
+            thresholdValue.textContent = e.target.value;
+        });
+
+        startBtn.addEventListener('click', startCamera);
+        stopBtn.addEventListener('click', stopCamera);
+
+        // 監聽視窗大小改變以調整 Overlay 大小
+        window.addEventListener('resize', fitOverlayCanvas);
+
+        function fitOverlayCanvas() {
+            if (!video.videoWidth) return;
+            // 這裡簡單將 canvas 設為顯示大小，實際繪製時會對應比例
+            gridOverlay.width = video.clientWidth;
+            gridOverlay.height = video.clientHeight;
+        }
+
+        async function startCamera() {
+            try {
+                addLog("請求相機權限...");
+                const constraints = {
+                    audio: false,
+                    video: {
+                        facingMode: "environment", // 嘗試後置
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 }
+                    }
+                };
+
+                stream = await navigator.mediaDevices.getUserMedia(constraints);
+                video.srcObject = stream;
+                
+                video.onloadedmetadata = () => {
+                    video.play();
+                    fitOverlayCanvas();
+                    startMonitoring();
+                };
+
+                startBtn.disabled = true;
+                startBtn.classList.add('opacity-50');
+                stopBtn.disabled = false;
+                stopBtn.classList.remove('opacity-50');
+                addLog("✅ 相機啟動，切換至矩陣模式");
+
+            } catch (err) {
+                console.error(err);
+                addLog("❌ 無法開啟相機: " + err.message);
+                alert("請允許相機權限或使用 HTTPS");
+            }
+        }
+
+        function stopCamera() {
+            isMonitoring = false;
+            cancelAnimationFrame(animationFrameId);
+            
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+                video.srcObject = null;
+            }
+
+            // 清空網格
+            gridCtx.clearRect(0, 0, gridOverlay.width, gridOverlay.height);
+            activeGridCountEl.textContent = "0";
+            activeGridCountEl.className = "font-mono text-xl font-bold text-green-400";
+            alertBanner.classList.add('hidden');
+
+            startBtn.disabled = false;
+            startBtn.classList.remove('opacity-50');
+            stopBtn.disabled = true;
+            stopBtn.classList.add('opacity-50');
+            statusText.textContent = "已停止";
+            addLog("監控已停止");
+        }
+
+        function startMonitoring() {
+            isMonitoring = true;
+            statusText.textContent = `監控中 (500區網格)`;
+            statusText.className = "text-xs text-green-400 font-bold animate-pulse";
+            
+            // 設定分析畫布大小為 25x20 (每個像素代表一格)
+            analysisCanvas.width = GRID_COLS;
+            analysisCanvas.height = GRID_ROWS;
+
+            processFrame();
+        }
+
+        function processFrame() {
+            if (!isMonitoring) return;
+
+            // 1. 將整個畫面縮小繪製到 25x20 的畫布上
+            // 瀏覽器縮放演算法會自動幫我們計算出每一格的平均顏色
+            analysisCtx.drawImage(video, 0, 0, GRID_COLS, GRID_ROWS);
+            
+            // 2. 取出這 500 個像素的資料
+            const frameData = analysisCtx.getImageData(0, 0, GRID_COLS, GRID_ROWS).data;
+
+            // 3. 準備繪製視覺化網格 (Overlay)
+            // 先清空上一幀的紅框
+            gridCtx.clearRect(0, 0, gridOverlay.width, gridOverlay.height);
+
+            // 計算 Overlay 上每一格的顯示寬高
+            const cellW = gridOverlay.width / GRID_COLS;
+            const cellH = gridOverlay.height / GRID_ROWS;
+
+            let triggeredCount = 0;
+            const threshold = parseInt(thresholdInput.value);
+
+            // 4. 比對每一個像素 (即每一個網格)
+            if (lastFrameData) {
+                gridCtx.fillStyle = 'rgba(255, 0, 0, 0.4)'; // 觸發時的紅色半透明遮罩
+
+                for (let i = 0; i < frameData.length; i += 4) {
+                    const rDiff = Math.abs(frameData[i] - lastFrameData[i]);
+                    const gDiff = Math.abs(frameData[i+1] - lastFrameData[i+1]);
+                    const bDiff = Math.abs(frameData[i+2] - lastFrameData[i+2]);
+                    
+                    // 單格總差異
+                    const diff = rDiff + gDiff + bDiff;
+
+                    // 判斷這一格是否超過門檻
+                    if (diff > threshold) {
+                        triggeredCount++;
+                        
+                        // 計算這是第幾行第幾列
+                        const pixelIndex = i / 4;
+                        const x = pixelIndex % GRID_COLS;
+                        const y = Math.floor(pixelIndex / GRID_COLS);
+
+                        // 在畫面上對應位置畫紅框
+                        gridCtx.fillRect(x * cellW, y * cellH, cellW, cellH);
+                    }
+                }
+
+                // 更新UI數值
+                activeGridCountEl.textContent = triggeredCount;
+                if (triggeredCount > 0) {
+                    activeGridCountEl.className = "font-mono text-xl font-bold text-red-500 scale-110 transition-transform";
+                } else {
+                    activeGridCountEl.className = "font-mono text-xl font-bold text-green-400";
+                }
+
+                // 5. 觸發通知邏輯
+                // 設定一個「最小觸發格數」，避免只有 1 格雜訊誤報，這裡設為 1 即可因為是遠距離
+                if (triggeredCount >= 1) {
+                    handleAlert(triggeredCount);
+                } else {
+                    alertBanner.classList.add('hidden');
+                }
+            }
+
+            // 複製當前幀數據到上一幀
+            lastFrameData = new Uint8ClampedArray(frameData);
+
+            animationFrameId = requestAnimationFrame(processFrame);
+        }
+
+        async function handleAlert(count) {
+            const now = Date.now();
+            
+            // 讀取使用者設定的冷卻時間
+            let cooldownSeconds = parseInt(cooldownInput.value);
+            if (isNaN(cooldownSeconds) || cooldownSeconds < 1) cooldownSeconds = 1;
+
+            // 顯示紅色橫幅
+            alertBanner.classList.remove('hidden');
+            alertBanner.textContent = `🚨 偵測到 ${count} 格區域變化!`;
+
+            // 冷卻時間檢查
+            if (now - lastAlertTime > cooldownSeconds * 1000) {
+                lastAlertTime = now;
+                const msg = `🔔 [500格矩陣] 偵測到變化！\n活躍格數: ${count}/500\n時間: ${new Date().toLocaleTimeString()}`;
+                
+                addLog("📸 正在擷取畫面並發送...");
+                
+                try {
+                    // 嘗試截圖
+                    const imageBlob = await captureFrame();
+                    await sendDiscordNotification(msg, imageBlob);
+                } catch (e) {
+                    console.error("截圖失敗:", e);
+                    addLog("⚠️ 截圖失敗，僅發送文字");
+                    await sendDiscordNotification(msg, null);
+                }
+            }
+        }
+
+        // 新增：截取當前影片幀
+        function captureFrame() {
+            if (!video.videoWidth) return null;
+            
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0);
+            
+            return new Promise(resolve => {
+                canvas.toBlob(resolve, 'image/jpeg', 0.8);
+            });
+        }
+
+        function addLog(msg) {
+            const div = document.createElement('div');
+            div.textContent = `> ${msg}`;
+            div.className = "mb-1 border-b border-slate-700 pb-1";
+            logs.insertBefore(div, logs.firstChild);
+            if (logs.children.length > 30) logs.removeChild(logs.lastChild);
+        }
+
+        async function sendDiscordNotification(content, imageBlob) {
+            
+            const formData = new FormData();
+            
+            // Discord Webhook 支援 multipart/form-data
+            // payload_json 欄位用於傳遞 JSON 資料
+            const payload = {
+                content: content,
+                username: "矩陣監控 Bot",
+                avatar_url: "https://i.imgur.com/A66428u.png"
+            };
+            
+            formData.append('payload_json', JSON.stringify(payload));
+            
+            if (imageBlob) {
+                formData.append('file', imageBlob, 'snapshot.jpg');
+            }
+
+            try {
+                // 使用 FormData 時不需要設定 Content-Type，瀏覽器會自動處理 boundary
+                const response = await fetch(DISCORD_WEBHOOK_URL, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (response.ok) addLog("✅ 通知與圖片已發送");
+                else addLog(`❌ 失敗: ${response.status}`);
+            } catch (error) {
+                console.error(error);
+                addLog("❌ 網絡/CORS 錯誤");
+            }
+        }
+    </script>
+</body>
+</html>
+
+
