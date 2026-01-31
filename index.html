@@ -98,7 +98,7 @@
 
     <script>
         // === 設定 ===
-        const DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1465823372138254572/h2nNklSC_ka5xaGG9X0smuwJtREl1zkdIavYUDNJDQs9u_GU6lf3uI5fPE0FJ1eZELLg";
+        const DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1360587650632781824/ksBqXJAPmPo1jwbctDGCJNsj7_aJYmtZ4PoGIDS4w1ttAqzmMkY3BqoA9kmspLUTpIvT";
         
         // 設定網格密度: 25行 x 20列 = 500格
         const GRID_COLS = 25; 
@@ -127,12 +127,20 @@
         let lastAlertTime = 0;
         let animationFrameId = null;
 
+        // === 音效 Context (Web Audio API) ===
+        let audioCtx = null;
+
         // === 初始化 ===
         thresholdInput.addEventListener('input', (e) => {
             thresholdValue.textContent = e.target.value;
         });
 
-        startBtn.addEventListener('click', startCamera);
+        startBtn.addEventListener('click', () => {
+            // 在使用者點擊時初始化 AudioContext (這是瀏覽器政策要求的)
+            initAudio();
+            startCamera();
+        });
+        
         stopBtn.addEventListener('click', stopCamera);
 
         // 監聽視窗大小改變以調整 Overlay 大小
@@ -143,6 +151,63 @@
             // 這裡簡單將 canvas 設為顯示大小，實際繪製時會對應比例
             gridOverlay.width = video.clientWidth;
             gridOverlay.height = video.clientHeight;
+        }
+
+        function initAudio() {
+            if (!audioCtx) {
+                // 兼容不同瀏覽器
+                const AudioContext = window.AudioContext || window.webkitAudioContext;
+                audioCtx = new AudioContext();
+            }
+            // 確保 Context 是運作中的
+            if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+        }
+
+        // 播放 1 秒鐘的 "叮咚" 聲
+        function playAlarmSound() {
+            if (!audioCtx) return;
+
+            const now = audioCtx.currentTime;
+
+            // --- 第一聲 "叮" (高音 C6 1046Hz) ---
+            const osc1 = audioCtx.createOscillator();
+            const gain1 = audioCtx.createGain();
+
+            osc1.type = 'triangle'; // 三角波，響亮且好聽
+            osc1.frequency.setValueAtTime(1046.5, now);
+            
+            // 音量包絡 (快速變大聲，然後慢慢消失)
+            gain1.gain.setValueAtTime(0, now);
+            gain1.gain.linearRampToValueAtTime(1.0, now + 0.05);
+            gain1.gain.exponentialRampToValueAtTime(0.01, now + 0.45);
+
+            osc1.connect(gain1);
+            gain1.connect(audioCtx.destination);
+            
+            osc1.start(now);
+            osc1.stop(now + 0.5); // 0.5秒後停
+
+            // --- 第二聲 "咚" (中音 G5 784Hz) ---
+            const osc2 = audioCtx.createOscillator();
+            const gain2 = audioCtx.createGain();
+
+            osc2.type = 'triangle';
+            osc2.frequency.setValueAtTime(783.99, now + 0.5); // 0.5秒時開始
+            
+            // 音量包絡
+            gain2.gain.setValueAtTime(0, now + 0.5);
+            gain2.gain.linearRampToValueAtTime(1.0, now + 0.55);
+            gain2.gain.exponentialRampToValueAtTime(0.01, now + 1.0);
+
+            osc2.connect(gain2);
+            gain2.connect(audioCtx.destination);
+            
+            osc2.start(now + 0.5);
+            osc2.stop(now + 1.1); // 1.1秒時完全結束
+            
+            addLog("🔊 叮咚！");
         }
 
         async function startCamera() {
@@ -300,6 +365,9 @@
                 lastAlertTime = now;
                 const msg = `🔔 [500格矩陣] 偵測到變化！\n活躍格數: ${count}/500\n時間: ${new Date().toLocaleTimeString()}`;
                 
+                // 1. 播放警報聲音 (新增功能)
+                playAlarmSound();
+
                 addLog("📸 正在擷取畫面並發送...");
                 
                 try {
